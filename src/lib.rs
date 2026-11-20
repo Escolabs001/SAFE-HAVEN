@@ -14,6 +14,80 @@ pub const RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 /// How long a computed dashboard snapshot stays cached before recomputation.
 pub const DASHBOARD_CACHE_TTL_SECS: u64 = 5;
 
+/// Explicit allowlist of origins permitted to make cross-origin API requests.
+///
+/// No wildcard (`*`) is ever used: only these origins receive CORS headers.
+pub const CORS_ALLOWED_ORIGINS: &[&str] = &[
+    "https://app.example.com",
+    "https://admin.example.com",
+    "http://localhost:3000",
+];
+
+/// HTTP methods permitted for cross-origin requests.
+pub const CORS_ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/// Request headers permitted for cross-origin requests.
+pub const CORS_ALLOWED_HEADERS: &[&str] = &["Authorization", "Content-Type", "Accept"];
+
+/// How long (seconds) browsers may cache a preflight response.
+pub const CORS_MAX_AGE_SECS: u64 = 600;
+
+/// Resolved CORS policy for a single request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsPolicy {
+    /// The request `Origin`, echoed back only when it is on the allowlist.
+    pub allow_origin: Option<String>,
+    /// Whether the request was a preflight (`OPTIONS` with `Access-Control-Request-Method`).
+    pub is_preflight: bool,
+}
+
+/// Evaluate the CORS policy for an incoming request.
+///
+/// Returns `None` when the origin is not on the allowlist, in which case no
+/// CORS headers should be emitted. Preflight requests are detected so the
+/// caller can short-circuit them with a `204 No Content` response.
+pub fn cors_policy(origin: Option<&str>, method: &str, requested_method: Option<&str>) -> Option<CorsPolicy> {
+    let origin = origin?;
+    if !CORS_ALLOWED_ORIGINS.contains(&origin) {
+        return None;
+    }
+    let is_preflight = method.eq_ignore_ascii_case("OPTIONS") && requested_method.is_some();
+    Some(CorsPolicy {
+        allow_origin: Some(origin.to_string()),
+        is_preflight,
+    })
+}
+
+/// Build the CORS response headers for a resolved [`CorsPolicy`].
+///
+/// Always includes `Vary: Origin` so caches do not serve one origin's
+/// response to another. Preflight responses additionally advertise the
+/// allowed methods, headers, and preflight cache lifetime.
+pub fn cors_headers(policy: &CorsPolicy) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("Vary".to_string(), "Origin".to_string()),
+        (
+            "Access-Control-Allow-Origin".to_string(),
+            policy.allow_origin.clone().unwrap_or_default(),
+        ),
+    ];
+    if policy.is_preflight {
+        headers.push((
+            "Access-Control-Allow-Methods".to_string(),
+            CORS_ALLOWED_METHODS.join(", "),
+        ));
+        headers.push((
+            "Access-Control-Allow-Headers".to_string(),
+            CORS_ALLOWED_HEADERS.join(", "),
+        ));
+        headers.push((
+            "Access-Control-Max-Age".to_string(),
+            CORS_MAX_AGE_SECS.to_string(),
+        ));
+    }
+    headers
+}
+
 /// A single recorded health sample.
 #[derive(Debug, Clone)]
 pub struct HealthSample {
@@ -229,7 +303,8 @@ impl MetricsCollector {
                 metric: "response_time".to_string(),
                 message: format!(
                     "Avg response time {:.0}ms exceeds threshold {:.0}ms",
-                    metrics.avg_response_time_ms, thresholds.max_avg_response_time_ms
+                    metrics.avg_response_time_ms,
+                    thresholds.max_avg_response_time_ms
                 ),
             });
         }
@@ -238,7 +313,8 @@ impl MetricsCollector {
                 metric: "db_time".to_string(),
                 message: format!(
                     "Avg DB time {:.0}ms exceeds threshold {:.0}ms",
-                    metrics.avg_db_time_ms, thresholds.max_db_time_ms
+                    metrics.avg_db_time_ms,
+                    thresholds.max_db_time_ms
                 ),
             });
         }
@@ -251,21 +327,3 @@ impl Default for MetricsCollector {
         Self::new()
     }
 }
-
-/// Render a plain-text monitoring dashboard from the collector's metrics.
-pub fn render_dashboard(collector: &MetricsCollector, thresholds: &AlertThresholds) -> String {
-    let metrics = collector.metrics();
-    let alerts = collector.check_alerts(thresholds);
-    let mut out = String::new();
-
-    out.push_str("=== System Health Dashboard ===\n");
-    out.push_str(&format!("Uptime: {}s\n", metrics.uptime_secs));
-    out.push_str(&format!("Requests: {}\n", metrics.total_requests));
-    out.push_str(&format!(
-        "API response time: avg {:.1}ms, p95 {:.1}ms\n",
-        metrics.avg_response_time_ms, metrics.p95_response_time_ms
-    ));
-    out.push_str(&format!(
-        "Error rate: {:.2}% ({
-
-/* … truncated 704 chars — edit only what you need near the top … */
