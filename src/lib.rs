@@ -11,6 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Number of seconds in the 30-day historical retention window.
 pub const RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// How long a computed dashboard snapshot stays cached before recomputation.
+pub const DASHBOARD_CACHE_TTL_SECS: u64 = 5;
+
 /// A single recorded health sample.
 #[derive(Debug, Clone)]
 pub struct HealthSample {
@@ -76,6 +79,10 @@ pub struct MetricsCollector {
 struct CollectorState {
     samples: VecDeque<HealthSample>,
     started_at: u64,
+    /// Cached aggregation result and the sample count it was computed from.
+    cached_metrics: Option<(usize, HealthMetrics)>,
+    /// Timestamp of the last cached aggregation, for TTL-based reuse.
+    cached_at: u64,
 }
 
 fn now_secs() -> u64 {
@@ -92,6 +99,8 @@ impl MetricsCollector {
             inner: Arc::new(Mutex::new(CollectorState {
                 samples: VecDeque::new(),
                 started_at: now_secs(),
+                cached_metrics: None,
+                cached_at: 0,
             })),
         }
     }
@@ -108,6 +117,8 @@ impl MetricsCollector {
                 break;
             }
         }
+        // Invalidate the cached aggregation so the next read reflects new data.
+        state.cached_metrics = None;
     }
 
     /// Convenience helper to record a request outcome.
@@ -129,13 +140,29 @@ impl MetricsCollector {
     }
 
     /// Compute aggregated metrics over all retained samples.
+    ///
+    /// Results are cached for [`DASHBOARD_CACHE_TTL_SECS`] so repeated dashboard
+    /// loads reuse the previous aggregation instead of rescanning the buffer.
     pub fn metrics(&self) -> HealthMetrics {
-        let state = self.inner.lock().expect("metrics lock poisoned");
+        let mut state = self.inner.lock().expect("metrics lock poisoned");
+        let now = now_secs();
+        if let Some((count, cached)) = &state.cached_metrics {
+            if *count == state.samples.len()
+                && now.saturating_sub(state.cached_at) < DASHBOARD_CACHE_TTL_SECS
+            {
+                let mut metrics = cached.clone();
+                metrics.uptime_secs = now.saturating_sub(state.started_at);
+                return metrics;
+            }
+        }
+
         let mut metrics = HealthMetrics {
-            uptime_secs: now_secs().saturating_sub(state.started_at),
+            uptime_secs: now.saturating_sub(state.started_at),
             ..Default::default()
         };
         if state.samples.is_empty() {
+            state.cached_metrics = Some((0, metrics.clone()));
+            state.cached_at = now;
             return metrics;
         }
 
@@ -175,6 +202,8 @@ impl MetricsCollector {
         error_types.sort_by(|a, b| b.1.cmp(&a.1));
         metrics.error_types = error_types;
 
+        state.cached_metrics = Some((state.samples.len(), metrics.clone()));
+        state.cached_at = now;
         metrics
     }
 
@@ -237,29 +266,6 @@ pub fn render_dashboard(collector: &MetricsCollector, thresholds: &AlertThreshol
         metrics.avg_response_time_ms, metrics.p95_response_time_ms
     ));
     out.push_str(&format!(
-        "Error rate: {:.2}% ({} errors)\n",
-        metrics.error_rate * 100.0,
-        metrics.error_count
-    ));
-    if !metrics.error_types.is_empty() {
-        out.push_str("Error types:\n");
-        for (kind, count) in &metrics.error_types {
-            out.push_str(&format!("  - {}: {}\n", kind, count));
-        }
-    }
-    out.push_str(&format!(
-        "Database: avg {:.1}ms, {} errors\n",
-        metrics.avg_db_time_ms, metrics.db_error_count
-    ));
+        "Error rate: {:.2}% ({
 
-    if alerts.is_empty() {
-        out.push_str("Status: HEALTHY\n");
-    } else {
-        out.push_str("Status: DEGRADED\n");
-        for alert in &alerts {
-            out.push_str(&format!("  ! [{}] {}\n", alert.metric, alert.message));
-        }
-    }
-
-    out
-}
+/* … truncated 704 chars — edit only what you need near the top … */
