@@ -1460,6 +1460,172 @@ mod prediction_market_tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    //  Issue #96: Get Market Outcome - Outcome Details Query
+    // ----------------------------------------------------------------
+
+    /// Place a bet from `bettor` on `outcome_id` after minting and approving tokens.
+    fn place_bet_for(
+        env: &Env,
+        contract: &Address,
+        token: &Address,
+        bettor: &Address,
+        market_id: u32,
+        outcome_id: u32,
+        amount: i128,
+    ) {
+        StellarAssetClient::new(env, token).mint(bettor, &amount);
+        TokenClient::new(env, token).approve(
+            bettor,
+            contract,
+            &amount,
+            &env.ledger().sequence().saturating_add(100),
+        );
+        env.as_contract(contract, || {
+            prediction_market::place_bet(
+                env,
+                bettor.clone(),
+                market_id,
+                outcome_id,
+                amount,
+                token.clone(),
+            )
+            .unwrap();
+        });
+    }
+
+    /// Multiple bets from different bettors on the same outcome aggregate into
+    /// total_bet_amount and a unique bettor_count.
+    #[test]
+    fn test_get_market_outcome_aggregates_multiple_bettors() {
+        let (env, contract, bettor_a, token, market_id, _) = betting_fixture();
+        let bettor_b = Address::generate(&env);
+        let bettor_c = Address::generate(&env);
+
+        place_bet_for(&env, &contract, &token, &bettor_a, market_id, 0, 100);
+        place_bet_for(&env, &contract, &token, &bettor_b, market_id, 0, 250);
+        place_bet_for(&env, &contract, &token, &bettor_c, market_id, 0, 50);
+
+        env.as_contract(&contract, || {
+            let outcome = storage::get_outcome_readonly(&env, market_id, 0).unwrap();
+            assert_eq!(outcome.outcome_id, 0);
+            assert_eq!(outcome.name, String::from_str(&env, "Yes"));
+            assert_eq!(outcome.total_bet_amount, 400);
+            assert_eq!(outcome.bettor_count, 3);
+        });
+    }
+
+    /// An outcome with no bets reports zero totals while still returning its name.
+    #[test]
+    fn test_get_market_outcome_zero_bets() {
+        let (env, contract, bettor, token, market_id, _) = betting_fixture();
+
+        // Only bet on outcome 0; outcome 1 stays untouched.
+        place_bet_for(&env, &contract, &token, &bettor, market_id, 0, 100);
+
+        env.as_contract(&contract, || {
+            let outcome = storage::get_outcome_readonly(&env, market_id, 1).unwrap();
+            assert_eq!(outcome.outcome_id, 1);
+            assert_eq!(outcome.name, String::from_str(&env, "No"));
+            assert_eq!(outcome.total_bet_amount, 0);
+            assert_eq!(outcome.bettor_count, 0);
+        });
+    }
+
+    /// Every outcome_id in the market is queryable and reports its own name.
+    #[test]
+    fn test_get_market_outcome_all_outcomes_queryable() {
+        let (env, contract, _bettor, _token, market_id, _) = betting_fixture();
+
+        env.as_contract(&contract, || {
+            let market = storage::get_market_readonly(&env, market_id).unwrap();
+            assert_eq!(market.outcome_count, 2);
+
+            let expected = ["Yes", "No"];
+            for idx in 0..market.outcome_count {
+                let outcome = storage::get_outcome_readonly(&env, market_id, idx).unwrap();
+                assert_eq!(outcome.outcome_id, idx);
+                assert_eq!(
+                    outcome.name,
+                    String::from_str(&env, expected[idx as usize])
+                );
+            }
+
+            // Out-of-range outcome_id returns None.
+            assert!(storage::get_outcome_readonly(&env, market_id, market.outcome_count).is_none());
+        });
+    }
+
+    // ----------------------------------------------------------------
+    //  Issue #97: Get User Bet - User Bet Query
+    // ----------------------------------------------------------------
+
+    /// A placed bet is retrievable with accurate amount, outcome_id, timestamp,
+    /// and claimed status.
+    #[test]
+    fn test_get_user_bet_returns_accurate_details() {
+        let (env, contract, bettor, token, market_id, _) = betting_fixture();
+
+        // Advance the ledger so the bet timestamp is distinguishable from zero.
+        advance_time(&env, 123);
+        let bet_time = env.ledger().timestamp();
+
+        place_bet_for(&env, &contract, &token, &bettor, market_id, 0, 75);
+
+        env.as_contract(&contract, || {
+            let bet = storage::get_bet_readonly(&env, market_id, 0, &bettor).unwrap();
+            assert_eq!(bet.bettor, bettor);
+            assert_eq!(bet.market_id, market_id);
+            assert_eq!(bet.outcome_id, 0);
+            assert_eq!(bet.amount, 75);
+            assert_eq!(bet.timestamp, bet_time);
+            assert!(!bet.claimed);
+        });
+    }
+
+    /// Querying a bet that was never placed returns None.
+    #[test]
+    fn test_get_user_bet_nonexistent_returns_none() {
+        let (env, contract, bettor, _token, market_id, _) = betting_fixture();
+        let stranger = Address::generate(&env);
+
+        env.as_contract(&contract, || {
+            // No bet placed by `bettor` at all.
+            assert!(storage::get_bet_readonly(&env, market_id, 0, &bettor).is_none());
+            // No bet placed by `stranger`.
+            assert!(storage::get_bet_readonly(&env, market_id, 0, &stranger).is_none());
+            // Non-existent market.
+            assert!(storage::get_bet_readonly(&env, 999, 0, &bettor).is_none());
+        });
+    }
+
+    /// The bet query is readonly: storage state is unchanged before and after.
+    #[test]
+    fn test_get_user_bet_is_readonly() {
+        let (env, contract, bettor, token, market_id, _) = betting_fixture();
+
+        place_bet_for(&env, &contract, &token, &bettor, market_id, 0, 40);
+
+        env.as_contract(&contract, || {
+            let bet_before = storage::get_bet_readonly(&env, market_id, 0, &bettor).unwrap();
+            let outcome_before = storage::get_outcome_readonly(&env, market_id, 0).unwrap();
+            let market_before = storage::get_market_readonly(&env, market_id).unwrap();
+
+            // Perform the query multiple times.
+            for _ in 0..3 {
+                let _ = storage::get_bet_readonly(&env, market_id, 0, &bettor).unwrap();
+            }
+
+            let bet_after = storage::get_bet_readonly(&env, market_id, 0, &bettor).unwrap();
+            let outcome_after = storage::get_outcome_readonly(&env, market_id, 0).unwrap();
+            let market_after = storage::get_market_readonly(&env, market_id).unwrap();
+
+            assert_eq!(bet_before, bet_after);
+            assert_eq!(outcome_before, outcome_after);
+            assert_eq!(market_before, market_after);
+        });
+    }
+
     /// Full lifecycle: create → close → resolve with data → query confirms data.
     #[test]
     fn test_full_lifecycle_resolution_data_stored() {

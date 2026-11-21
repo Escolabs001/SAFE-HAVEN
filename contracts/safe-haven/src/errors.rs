@@ -63,4 +63,6 @@ pub enum VaultError {
     InvalidRenewableEnergyPercent = 28,
     /// Recipient address is invalid (zero address)
     InvalidRecipient = 28,
+    /// Staker registration amount must be greater than zero (issue #51).
+    InvalidStakeAmount = 29,
 }
