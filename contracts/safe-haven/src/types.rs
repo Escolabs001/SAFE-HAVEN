@@ -131,6 +131,17 @@ pub enum VaultKey {
     SustainabilityMetrics(Address, u32),
     TotalCarbonFootprint(Address),
     TotalCarbonOffset(Address),
+    /// Per-depositor bitmap of achieved sustainability milestones (issue #830).
+    ///
+    /// Stores a `u32` where each of the 4 low bits represents one milestone:
+    /// - bit 0: first milestone achieved
+    /// - bit 1: second milestone achieved
+    /// - bit 2: third milestone achieved
+    /// - bit 3: fourth milestone achieved
+    ///
+    /// A bit is set exactly once, the first time the corresponding milestone is
+    /// achieved, and is never cleared. This guarantees each milestone event is
+    /// emitted at most once per depositor (no duplicate emissions).
     MilestoneAchieved(Address),
     /// NFT evolution record: maps (depositor, deposit_id) to NFTEvolutionRecord
     NFTEvolution(Address, u32),

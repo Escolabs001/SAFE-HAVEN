@@ -1550,6 +1550,12 @@ pub fn set_total_carbon_offset(env: &Env, depositor: &Address, total: i128) {
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TARGET);
 }
 
+/// Number of sustainability milestone bits tracked in the bitmap.
+pub const MILESTONE_BITMAP_BITS: u32 = 4;
+
+/// Mask covering all valid milestone bits (4 bits → 0b1111).
+pub const MILESTONE_BITMAP_MASK: u32 = (1u32 << MILESTONE_BITMAP_BITS) - 1;
+
 /// Check if a depositor has achieved a specific milestone.
 /// Returns a bitmap where each bit represents a different milestone type.
 pub fn get_milestone_bitmap(env: &Env, depositor: &Address) -> u32 {
@@ -1561,12 +1567,45 @@ pub fn get_milestone_bitmap(env: &Env, depositor: &Address) -> u32 {
 }
 
 /// Set milestone bitmap for a depositor.
+///
+/// The bitmap is immutable once a bit is set: this helper only ever ORs the
+/// incoming bits into the stored value, so previously achieved milestones can
+/// never be cleared. Only bits within `MILESTONE_BITMAP_MASK` are persisted.
 pub fn set_milestone_bitmap(env: &Env, depositor: &Address, bitmap: u32) {
     let key = VaultKey::MilestoneAchieved(depositor.clone());
-    env.storage().persistent().set(&key, &bitmap);
+    let current: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+    let merged = (current | bitmap) & MILESTONE_BITMAP_MASK;
+    env.storage().persistent().set(&key, &merged);
     env.storage()
         .persistent()
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TARGET);
+}
+
+/// Returns `true` if the milestone identified by `bit` (0-based) has already
+/// been achieved by `depositor`. Out-of-range bits are treated as unset.
+pub fn is_milestone_set(env: &Env, depositor: &Address, bit: u32) -> bool {
+    if bit >= MILESTONE_BITMAP_BITS {
+        return false;
+    }
+    let bitmap = get_milestone_bitmap(env, depositor);
+    (bitmap & (1u32 << bit)) != 0
+}
+
+/// Mark the milestone identified by `bit` (0-based) as achieved for
+/// `depositor`. Returns `true` if this call newly set the bit (i.e. the
+/// milestone was not previously achieved), `false` if it was already set or
+/// `bit` is out of range. Bits are only ever set, never cleared.
+pub fn set_milestone(env: &Env, depositor: &Address, bit: u32) -> bool {
+    if bit >= MILESTONE_BITMAP_BITS {
+        return false;
+    }
+    let flag = 1u32 << bit;
+    let current = get_milestone_bitmap(env, depositor);
+    if (current & flag) != 0 {
+        return false;
+    }
+    set_milestone_bitmap(env, depositor, flag);
+    true
 }
 
 
