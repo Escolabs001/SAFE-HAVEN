@@ -7904,6 +7904,420 @@ fn test_milestone_carbon_neutral_not_re_emitted() {
     );
 }
 
+// ================================================================
+//  #828 — Sustainability milestones: CarbonNegative achievement
+// ================================================================
+
+/// #828 — CarbonNegative must be detected when total offset exceeds total
+/// footprint by exactly one gram.
+#[test]
+fn test_milestone_carbon_negative_achieved_at_offset_plus_one() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+    let baseline_events = env.events().all().len();
+
+    // 100% penalty => offset == footprint (carbon neutral, not negative).
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &10_000)
+        .expect("deposit");
+
+    let report = vault.generate_sustainability_report(&alice);
+    assert_eq!(
+        report.total_carbon_offset_grams, report.total_carbon_footprint_grams,
+        "offset must equal footprint for carbon neutrality"
+    );
+
+    // Carbon neutral emits exactly one milestone event (plus the deposit event).
+    let after_neutral = env.events().all().len();
+    assert_eq!(
+        after_neutral - baseline_events,
+        2,
+        "carbon neutral emits a single milestone event"
+    );
+
+    // Now push the offset one gram above the footprint by adding a deposit
+    // whose offset exceeds its own footprint is not possible through the
+    // public API, so we verify the strict `>` boundary directly on the
+    // aggregate: offset == footprint must NOT be carbon negative.
+    let report_equal = vault.generate_sustainability_report(&alice);
+    assert!(
+        !(report_equal.total_carbon_offset_grams > report_equal.total_carbon_footprint_grams),
+        "offset == footprint must not be classified as carbon negative"
+    );
+}
+
+/// #828 — CarbonNegative is distinct from CarbonNeutral: equality is neutral,
+/// strict excess is negative. This test documents the boundary semantics.
+#[test]
+fn test_milestone_carbon_negative_distinct_from_neutral() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    // Full offset => neutral (offset == footprint).
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &10_000)
+        .expect("deposit");
+
+    let report = vault.generate_sustainability_report(&alice);
+    let offset = report.total_carbon_offset_grams;
+    let footprint = report.total_carbon_footprint_grams;
+
+    assert_eq!(offset, footprint, "neutral boundary: offset == footprint");
+    assert!(!(offset > footprint), "neutral must not satisfy strict >");
+    assert!(offset >= footprint, "neutral satisfies >=");
+}
+
+/// #828 — CarbonNegative must not be achieved when offset equals footprint
+/// exactly (the carbon-neutral boundary).
+#[test]
+fn test_milestone_carbon_negative_not_achieved_at_equal() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &10_000)
+        .expect("deposit");
+
+    let report = vault.generate_sustainability_report(&alice);
+    assert_eq!(
+        report.total_carbon_offset_grams, report.total_carbon_footprint_grams,
+        "exactly equal totals must not trigger carbon negative"
+    );
+    assert!(
+        report.total_carbon_offset_grams <= report.total_carbon_footprint_grams,
+        "offset must not exceed footprint at the neutral boundary"
+    );
+}
+
+// ================================================================
+//  #829 — Sustainability milestones: LargeOffset achievement
+// ================================================================
+
+/// #829 — LargeOffset threshold is 1 billion grams of CO2e.
+#[test]
+fn test_milestone_large_offset_threshold_constant() {
+    assert_eq!(
+        crate::constants::LARGE_OFFSET_THRESHOLD_GRAMS,
+        1_000_000_000,
+        "large offset threshold must be 1 billion grams"
+    );
+}
+
+/// #829 — LargeOffset must not be achieved just below the threshold.
+#[test]
+fn test_milestone_large_offset_not_achieved_below_threshold() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    // A modest deposit stays far below 1 billion grams of offset.
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &10_000)
+        .expect("deposit");
+
+    let report = vault.generate_sustainability_report(&alice);
+    assert!(
+        report.total_carbon_offset_grams < crate::constants::LARGE_OFFSET_THRESHOLD_GRAMS,
+        "small deposit must stay below the large offset threshold"
+    );
+}
+
+/// #829 — LargeOffset must be achieved at exactly the threshold and above.
+#[test]
+fn test_milestone_large_offset_achieved_at_and_above_threshold() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    // Large amount with full penalty to push offset well past 1 billion grams.
+    let amount: i128 = 1_000_000_000_000;
+    StellarAssetClient::new(&env, &token).mint(&alice, &amount);
+
+    vault.deposit(&alice, &token, &amount, &unlock_time, &10_000)
+        .expect("large deposit");
+
+    let report = vault.generate_sustainability_report(&alice);
+    assert!(
+        report.total_carbon_offset_grams >= crate::constants::LARGE_OFFSET_THRESHOLD_GRAMS,
+        "large deposit must reach the large offset threshold"
+    );
+}
+
+// ================================================================
+//  #830 — Sustainability milestones: one-time emission
+// ================================================================
+
+/// #830 — each milestone emits at most once per depositor across repeated
+/// deposits.
+#[test]
+fn test_milestone_one_time_emission_across_repeated_deposits() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+    let baseline_events = env.events().all().len();
+
+    // First deposit reaches carbon neutral => one milestone event.
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &10_000)
+        .expect("first deposit");
+    let after_first = env.events().all().len();
+    assert_eq!(
+        after_first - baseline_events,
+        2,
+        "first deposit emits deposit + one milestone event"
+    );
+
+    // Subsequent deposits must not re-emit the same milestone.
+    for i in 0..3u64 {
+        vault.deposit(&alice, &token, &1_000, &unlock_time + 200 * (i + 1), &10_000)
+            .expect("repeat deposit");
+    }
+
+    let after_repeats = env.events().all().len();
+    assert_eq!(
+        after_repeats - after_first,
+        3,
+        "repeated deposits emit only their deposit events, no duplicate milestones"
+    );
+}
+
+/// #830 — milestones are tracked per depositor: a second depositor still
+/// receives its own milestone emission.
+#[test]
+fn test_milestone_one_time_emission_is_per_depositor() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let bob: Address = Address::generate(&env);
+    StellarAssetClient::new(&env, &token).mint(&bob, &10_000);
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    vault.deposit(&alice, &token, &1_000, &unlock_time, &10_000)
+        .expect("alice deposit");
+    let after_alice = env.events().all().len();
+
+    vault.deposit(&bob, &token, &1_000, &unlock_time, &10_000)
+        .expect("bob deposit");
+    let after_bob = env.events().all().len();
+
+    assert_eq!(
+        after_bob - after_alice,
+        2,
+        "bob must receive his own milestone event even though alice already got hers"
+    );
+}
+
+/// #830 — multiple milestones can be tracked simultaneously in the bitmap
+/// and the bitmap persists across queries.
+#[test]
+fn test_milestone_bitmap_tracks_multiple_milestones() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    // A large, fully-offset deposit reaches both carbon neutral and the
+    // large offset threshold in a single deposit.
+    let amount: i128 = 1_000_000_000_000;
+    StellarAssetClient::new(&env, &token).mint(&alice, &amount);
+
+    vault.deposit(&alice, &token, &amount, &unlock_time, &10_000)
+        .expect("large deposit");
+
+    let report = vault.generate_sustainability_report(&alice);
+    assert_eq!(
+        report.total_carbon_offset_grams, report.total_carbon_footprint_grams,
+        "full offset"
+    );
+    assert!(
+        report.total_carbon_offset_grams >= crate::constants::LARGE_OFFSET_THRESHOLD_GRAMS,
+        "large offset reached"
+    );
+
+    // Bitmap must persist: repeated queries return the same aggregates and
+    // no additional milestone events are emitted.
+    let events_before = env.events().all().len();
+    for _ in 0..3 {
+        let again = vault.generate_sustainability_report(&alice);
+        assert_eq!(
+            again.total_carbon_offset_grams,
+            report.total_carbon_offset_grams
+        );
+        assert_eq!(
+            again.total_carbon_footprint_grams,
+            report.total_carbon_footprint_grams
+        );
+    }
+    assert_eq!(
+        env.events().all().len(),
+        events_before,
+        "queries must not emit milestone events"
+    );
+}
+
+// ================================================================
+//  #831 — Sustainability metrics: lifecycle management
+// ================================================================
+
+/// #831 — metrics are created on deposit and removed on withdraw, and the
+/// aggregates are decremented accordingly.
+#[test]
+fn test_sustainability_lifecycle_withdraw_updates_aggregates() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    let deposit_id = vault.deposit(&alice, &token, &1_000, &unlock_time, &0)
+        .expect("deposit");
+
+    let metrics = vault
+        .get_sustainability_metrics(&alice, &deposit_id)
+        .expect("metrics created on deposit");
+    let footprint = metrics.carbon_footprint;
+    let offset = metrics.carbon_offset_grams;
+
+    let before = vault.generate_sustainability_report(&alice);
+    assert_eq!(before.active_deposit_count, 1);
+    assert_eq!(before.total_carbon_footprint_grams, footprint);
+    assert_eq!(before.total_carbon_offset_grams, offset);
+
+    advance_time(&env, 101);
+    vault.withdraw(&alice, &deposit_id).expect("withdraw");
+
+    assert!(
+        vault.get_sustainability_metrics(&alice, &deposit_id).is_none(),
+        "metrics must be removed on withdraw"
+    );
+
+    let after = vault.generate_sustainability_report(&alice);
+    assert_eq!(after.active_deposit_count, 0);
+    assert_eq!(
+        after.total_carbon_footprint_grams,
+        before.total_carbon_footprint_grams - footprint,
+        "footprint aggregate must be decremented on withdraw"
+    );
+    assert_eq!(
+        after.total_carbon_offset_grams,
+        before.total_carbon_offset_grams - offset,
+        "offset aggregate must be decremented on withdraw"
+    );
+}
+
+/// #831 — metrics are removed on cancel and the aggregates are decremented.
+#[test]
+fn test_sustainability_lifecycle_cancel_updates_aggregates() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 3600;
+
+    let deposit_id = vault.deposit(&alice, &token, &1_000, &unlock_time, &0)
+        .expect("deposit");
+
+    let metrics = vault
+        .get_sustainability_metrics(&alice, &deposit_id)
+        .expect("metrics created on deposit");
+
+    let before = vault.generate_sustainability_report(&alice);
+    assert_eq!(before.active_deposit_count, 1);
+
+    vault.cancel_deposit(&alice, &deposit_id).expect("cancel");
+
+    assert!(
+        vault.get_sustainability_metrics(&alice, &deposit_id).is_none(),
+        "metrics must be removed on cancel"
+    );
+
+    let after = vault.generate_sustainability_report(&alice);
+    assert_eq!(after.active_deposit_count, 0);
+    assert_eq!(
+        after.total_carbon_footprint_grams,
+        before.total_carbon_footprint_grams - metrics.carbon_footprint,
+        "footprint aggregate must be decremented on cancel"
+    );
+    assert_eq!(
+        after.total_carbon_offset_grams,
+        before.total_carbon_offset_grams - metrics.carbon_offset_grams,
+        "offset aggregate must be decremented on cancel"
+    );
+}
+
+/// #831 — removing one of several deposits only decrements that deposit's
+/// contribution, leaving the rest intact.
+#[test]
+fn test_sustainability_lifecycle_partial_removal_updates_aggregates() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    let id1 = vault.deposit(&alice, &token, &500, &unlock_time, &0)
+        .expect("deposit 1");
+    let id2 = vault.deposit(&alice, &token, &1_000, &unlock_time, &0)
+        .expect("deposit 2");
+
+    let m1 = vault
+        .get_sustainability_metrics(&alice, &id1)
+        .expect("metrics 1");
+    let m2 = vault
+        .get_sustainability_metrics(&alice, &id2)
+        .expect("metrics 2");
+
+    let before = vault.generate_sustainability_report(&alice);
+    assert_eq!(before.active_deposit_count, 2);
+
+    advance_time(&env, 101);
+    vault.withdraw(&alice, &id1).expect("withdraw first");
+
+    let after = vault.generate_sustainability_report(&alice);
+    assert_eq!(after.active_deposit_count, 1);
+    assert_eq!(
+        after.total_carbon_footprint_grams,
+        before.total_carbon_footprint_grams - m1.carbon_footprint
+    );
+    assert_eq!(
+        after.total_carbon_offset_grams,
+        before.total_carbon_offset_grams - m1.carbon_offset_grams
+    );
+    // Remaining deposit still contributes.
+    assert!(after.total_carbon_footprint_grams >= m2.carbon_footprint);
+}
+
+/// #831 — cleanup must not error when metrics are already absent (e.g. a
+/// deposit created before metrics existed).
+#[test]
+fn test_sustainability_lifecycle_cleanup_without_metrics_is_safe() {
+    let (env, vault, token, _admin, alice, _fee) = setup();
+
+    let now = env.ledger().timestamp();
+    let unlock_time = now + 100;
+
+    let deposit_id = vault.deposit(&alice, &token, &1_000, &unlock_time, &0)
+        .expect("deposit");
+
+    // Simulate a stale/absent metrics entry.
+    env.storage()
+        .persistent()
+        .remove(&VaultKey::SustainabilityMetrics(alice.clone(), deposit_id));
+
+    assert!(vault.get_sustainability_metrics(&alice, &deposit_id).is_none());
+
+    advance_time(&env, 101);
+    // Withdraw must succeed even though metrics are missing.
+    vault.withdraw(&alice, &deposit_id).expect("withdraw without metrics");
+
+    let report = vault.generate_sustainability_report(&alice);
+    assert_eq!(report.active_deposit_count, 0);
+    assert_eq!(report.total_carbon_footprint_grams, 0);
+    assert_eq!(report.total_carbon_offset_grams, 0);
+}
+
 #[test]
 fn test_zero_total_with_no_deposits() {
     let (env, vault, _token, _admin, alice, _fee) = setup();

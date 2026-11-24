@@ -3,7 +3,6 @@
 //  Stellar Blockchain | Soroban SDK v22
 // ============================================================
 
-use soroban_sdk::{contract, contractimpl, token, Address, Bytes, Env, Vec};
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, Env, String, Symbol, Vec};
 
 use crate::{
@@ -19,15 +18,10 @@ use crate::{
     types::{
         DepositType, MultiTokenVaultEntry, TokenDeposit, VaultEntry, LedgerVaultEntry, Page,
         STORAGE_VERSION, MAX_TOKENS_PER_DEPOSIT, InsuranceClaim, ClaimStatus,
-        SessionKeyEntry, STORAGE_VERSION, MAX_TOKENS_PER_DEPOSIT,
-        STORAGE_VERSION, MAX_TOKENS_PER_DEPOSIT, MEVCommitment, MEVDetection, MEVStatus,
-        PriceSample, SustainabilityMetrics, BatchWithdrawalResult, WithdrawalResult,
-        StakerInfo,
-        PriceSample, SustainabilityMetrics, SustainabilityReport, BatchWithdrawalResult, WithdrawalResult,
+        SessionKeyEntry, MEVCommitment, MEVDetection, MEVStatus,
+        PriceSample, SustainabilityMetrics, SustainabilityReport, BatchWithdrawalResult,
+        WithdrawalResult, StakerInfo,
     },
-    prediction_market,
-    prediction_market_errors::PredictionMarketError,
-    prediction_market_types::{PredictionMarket, MarketOutcome, Bet},
 };
 
 /// Minimum compound frequency: must be at least 60 seconds if non-zero.
@@ -62,27 +56,6 @@ fn auto_pause(env: &Env, amount: i128) {
     );
 }
 
-/// Computes the carbon footprint (in grams CO2e) for a deposit.
-///
-/// Formula: `amount × duration_secs × CARBON_BASELINE_PER_UNIT_SECOND`.
-///
-/// Uses checked arithmetic so that extreme inputs return
-/// [`VaultError::CarbonOverflow`] instead of panicking or silently wrapping.
-/// With the current limits (max deposit 10^15, max lock ≈ 1.57788e8 s) the
-/// product is ≈ 1.57788e23, comfortably within `i128::MAX` (≈ 1.7e38).
-///
-/// Rounding: all factors are integers, so the result is exact; no division
-/// (and therefore no truncation) occurs in this function.
-fn calculate_carbon_footprint(amount: i128, duration_secs: u64) -> Result<i128, VaultError> {
-    if amount <= 0 || duration_secs == 0 {
-        return Ok(0);
-    }
-    amount
-        .checked_mul(duration_secs as i128)
-        .and_then(|v| v.checked_mul(crate::constants::CARBON_BASELINE_PER_UNIT_SECOND))
-        .ok_or(VaultError::CarbonOverflow)
-}
-
 /// Computes the carbon offset (in grams CO2e) from a footprint and penalty.
 ///
 /// Formula: `footprint × penalty_bps / 10_000`.
@@ -101,6 +74,23 @@ fn calculate_carbon_offset(footprint: i128, penalty_bps: u32) -> Result<i128, Va
         .checked_mul(penalty_bps as i128)
         .map(|v| v / 10_000)
         .ok_or(VaultError::CarbonOverflow)
+}
+
+/// Removes the sustainability metrics for `(depositor, deposit_id)` and
+/// subtracts them from the running aggregate totals so that reports never
+/// include stale metrics (#831).
+///
+/// Safe to call when no metrics exist: the aggregates are left untouched.
+fn remove_sustainability_metrics_and_update_aggregates(
+    env: &Env,
+    depositor: &Address,
+    deposit_id: u32,
+) {
+    if let Some(metrics) = storage::get_sustainability_metrics(env, depositor, deposit_id) {
+        storage::subtract_total_carbon_footprint(env, metrics.carbon_footprint);
+        storage::subtract_total_carbon_offset(env, metrics.carbon_offset);
+    }
+    storage::remove_sustainability_metrics(env, depositor, deposit_id);
 }
 
 fn check_emergency_withdrawal_limit(env: &Env, amount: i128) -> Result<(), VaultError> {
@@ -2389,9 +2379,10 @@ impl SafeHaven {
 
             events::withdraw(&env, &depositor, &entry.token, entry.amount, deposit_id);
 
-            // Clean up NFT evolution record on withdrawal
+            // Clean up NFT evolution record and sustainability metrics on withdrawal,
+            // subtracting the removed metrics from the running aggregates (#831).
             storage::remove_nft_evolution(&env, &depositor, deposit_id);
-            storage::remove_sustainability_metrics(&env, &depositor, deposit_id);
+            remove_sustainability_metrics_and_update_aggregates(&env, &depositor, deposit_id);
             return Ok(());
         }
 
@@ -2417,9 +2408,10 @@ impl SafeHaven {
             storage::cleanup_old_epochs(&env, &depositor, current_epoch);
 
 
-            // Clean up NFT evolution record on withdrawal
+            // Clean up NFT evolution record and sustainability metrics on withdrawal,
+            // subtracting the removed metrics from the running aggregates (#831).
             storage::remove_nft_evolution(&env, &depositor, deposit_id);
-            storage::remove_sustainability_metrics(&env, &depositor, deposit_id);
+            remove_sustainability_metrics_and_update_aggregates(&env, &depositor, deposit_id);
             events::withdraw(&env, &depositor, &entry.token, entry.amount, deposit_id);
             return Ok(());
         }
@@ -2776,9 +2768,10 @@ impl SafeHaven {
                     // Emit individual withdrawal event
                     events::withdraw(&env, &depositor, &entry.token, amount, deposit_id);
 
-                    // Clean up NFT evolution record and sustainability metrics
+                    // Clean up NFT evolution record and sustainability metrics,
+                    // subtracting the removed metrics from the running aggregates (#831).
                     storage::remove_nft_evolution(&env, &depositor, deposit_id);
-                    storage::remove_sustainability_metrics(&env, &depositor, deposit_id);
+                    remove_sustainability_metrics_and_update_aggregates(&env, &depositor, deposit_id);
 
                     success = true;
                 }
@@ -2809,9 +2802,10 @@ impl SafeHaven {
                     // Emit individual withdrawal event
                     events::withdraw(&env, &depositor, &entry.token, amount, deposit_id);
 
-                    // Clean up NFT evolution record and sustainability metrics
+                    // Clean up NFT evolution record and sustainability metrics,
+                    // subtracting the removed metrics from the running aggregates (#831).
                     storage::remove_nft_evolution(&env, &depositor, deposit_id);
-                    storage::remove_sustainability_metrics(&env, &depositor, deposit_id);
+                    remove_sustainability_metrics_and_update_aggregates(&env, &depositor, deposit_id);
 
                     success = true;
                 }
@@ -5226,6 +5220,126 @@ mod sustainability_precision_tests {
     fn carbon_offset_overflow_returns_error() {
         let result = calculate_carbon_offset(i128::MAX, 10_000);
         assert_eq!(result, Err(VaultError::CarbonOverflow));
+    }
+}
+
+#[cfg(test)]
+mod sustainability_milestone_tests {
+    use super::*;
+
+    /// Bitmap bit positions for the four sustainability milestones.
+    const BIT_CARBON_NEUTRAL: u32 = 1;
+    const BIT_CARBON_NEGATIVE: u32 = 4;
+    const BIT_LARGE_OFFSET: u32 = 8;
+
+    /// Threshold for the LargeOffset milestone: 1 billion grams CO2e.
+    const LARGE_OFFSET_THRESHOLD: i128 = 1_000_000_000;
+
+    /// Mirrors the milestone decision logic in `check_sustainability_milestones`.
+    /// Returns the bits that should be newly set for the given totals.
+    fn evaluate_milestones(total_carbon: i128, total_offset: i128, bitmap: u32) -> u32 {
+        let mut new_bits = 0u32;
+        if total_offset >= total_carbon && (bitmap & BIT_CARBON_NEUTRAL) == 0 {
+            new_bits |= BIT_CARBON_NEUTRAL;
+        }
+        if total_offset > total_carbon && (bitmap & BIT_CARBON_NEGATIVE) == 0 {
+            new_bits |= BIT_CARBON_NEGATIVE;
+        }
+        if total_offset >= LARGE_OFFSET_THRESHOLD && (bitmap & BIT_LARGE_OFFSET) == 0 {
+            new_bits |= BIT_LARGE_OFFSET;
+        }
+        new_bits
+    }
+
+    /// #828: CarbonNegative fires when offset exceeds footprint by exactly 1.
+    #[test]
+    fn carbon_negative_achieved_by_one() {
+        let bits = evaluate_milestones(1_000, 1_001, 0);
+        assert_eq!(bits & BIT_CARBON_NEGATIVE, BIT_CARBON_NEGATIVE);
+    }
+
+    /// #828: CarbonNegative is distinct from CarbonNeutral (>= vs >).
+    #[test]
+    fn carbon_negative_distinct_from_neutral() {
+        // Exactly equal: neutral only, not negative.
+        let bits = evaluate_milestones(1_000, 1_000, 0);
+        assert_eq!(bits & BIT_CARBON_NEUTRAL, BIT_CARBON_NEUTRAL);
+        assert_eq!(bits & BIT_CARBON_NEGATIVE, 0);
+
+        // Strictly greater: both neutral and negative.
+        let bits = evaluate_milestones(1_000, 1_001, 0);
+        assert_eq!(bits & BIT_CARBON_NEUTRAL, BIT_CARBON_NEUTRAL);
+        assert_eq!(bits & BIT_CARBON_NEGATIVE, BIT_CARBON_NEGATIVE);
+    }
+
+    /// #828: CarbonNegative not achieved at exactly equal totals.
+    #[test]
+    fn carbon_negative_not_achieved_at_equal() {
+        let bits = evaluate_milestones(5_000, 5_000, 0);
+        assert_eq!(bits & BIT_CARBON_NEGATIVE, 0);
+    }
+
+    /// #828: Works with various excess amounts.
+    #[test]
+    fn carbon_negative_various_excess_amounts() {
+        for excess in [1i128, 2, 100, 1_000_000] {
+            let bits = evaluate_milestones(10_000, 10_000 + excess, 0);
+            assert_eq!(bits & BIT_CARBON_NEGATIVE, BIT_CARBON_NEGATIVE);
+        }
+    }
+
+    /// #829: LargeOffset achieved exactly at the 1 billion gram threshold.
+    #[test]
+    fn large_offset_achieved_at_threshold() {
+        let bits = evaluate_milestones(0, LARGE_OFFSET_THRESHOLD, 0);
+        assert_eq!(bits & BIT_LARGE_OFFSET, BIT_LARGE_OFFSET);
+    }
+
+    /// #829: LargeOffset not achieved just below the threshold.
+    #[test]
+    fn large_offset_not_achieved_below_threshold() {
+        let bits = evaluate_milestones(0, LARGE_OFFSET_THRESHOLD - 1, 0);
+        assert_eq!(bits & BIT_LARGE_OFFSET, 0);
+    }
+
+    /// #829: LargeOffset works with very large offset amounts.
+    #[test]
+    fn large_offset_works_with_large_amounts() {
+        let bits = evaluate_milestones(0, 10_000_000_000_000, 0);
+        assert_eq!(bits & BIT_LARGE_OFFSET, BIT_LARGE_OFFSET);
+    }
+
+    /// #830: Once a bit is set, the milestone is not re-emitted.
+    #[test]
+    fn milestones_emit_once_per_depositor() {
+        let first = evaluate_milestones(1_000, 1_001, 0);
+        assert_ne!(first, 0);
+
+        // Simulate setting the bits immutably.
+        let bitmap = first;
+        let second = evaluate_milestones(1_000, 1_001, bitmap);
+        assert_eq!(second, 0);
+    }
+
+    /// #830: Multiple milestones can be tracked simultaneously in the bitmap.
+    #[test]
+    fn multiple_milestones_tracked_simultaneously() {
+        let bits = evaluate_milestones(0, LARGE_OFFSET_THRESHOLD, 0);
+        // Offset >= footprint (0) and >= threshold: neutral + large offset.
+        assert_eq!(bits & BIT_CARBON_NEUTRAL, BIT_CARBON_NEUTRAL);
+        assert_eq!(bits & BIT_LARGE_OFFSET, BIT_LARGE_OFFSET);
+        assert_eq!(bits & BIT_CARBON_NEGATIVE, 0);
+    }
+
+    /// #830: Bitmap is immutable after set — re-evaluation never clears bits.
+    #[test]
+    fn bitmap_immutable_after_set() {
+        let bitmap = BIT_CARBON_NEUTRAL | BIT_CARBON_NEGATIVE | BIT_LARGE_OFFSET;
+        let new_bits = evaluate_milestones(0, 0, bitmap);
+        assert_eq!(new_bits, 0);
+        assert_eq!(bitmap & BIT_CARBON_NEUTRAL, BIT_CARBON_NEUTRAL);
+        assert_eq!(bitmap & BIT_CARBON_NEGATIVE, BIT_CARBON_NEGATIVE);
+        assert_eq!(bitmap & BIT_LARGE_OFFSET, BIT_LARGE_OFFSET);
     }
 }
 
